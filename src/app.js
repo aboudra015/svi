@@ -1,14 +1,31 @@
 import {
+  AUDIO_PROMPT_KEYS,
   DEFAULT_CONFIG,
   STORAGE_KEY,
+  addAudioAsset,
   addCallback,
+  addEndpoint,
+  assignAudioPrompt,
+  buildConfigurationExport,
+  buildEndpointExport,
   createInitialState,
   getMetrics,
   normalizeState,
+  removeAudioAsset,
+  removeEndpoint,
   recordCall,
+  updateEndpoint,
   updateCallbackStatus,
+  validateAudioFile,
+  validatePbxHost,
   validatePhone,
 } from "./domain.js";
+import {
+  clearAudioFiles,
+  deleteAudioFile,
+  getAudioFile,
+  saveAudioFile,
+} from "./audio-store.js";
 
 const pageContent = document.querySelector("#page-content");
 const overlayRoot = document.querySelector("#overlay-root");
@@ -16,6 +33,8 @@ const breadcrumb = document.querySelector("#breadcrumb-current");
 const titles = {
   accueil: "Vue d’ensemble",
   parcours: "Parcours vocal",
+  extensions: "Extensions & postes",
+  audio: "Messages audio",
   architecture: "Architecture téléphonique",
   rappels: "Demandes de rappel",
   rapports: "Rapports",
@@ -26,6 +45,10 @@ let state = loadState();
 let activePage = "accueil";
 let simulator = null;
 let selectedArchitecture = "local-fxo";
+let editingEndpointId = null;
+let audioBlobs = new Map();
+let audioObjectUrls = [];
+let audioFilesReady = false;
 let toastTimer;
 
 document.querySelector("#current-year").textContent = new Date().getFullYear();
@@ -39,9 +62,11 @@ document.querySelector(".brand").addEventListener("click", (event) => {
 document.querySelector("#help-button").addEventListener("click", showAbout);
 document.addEventListener("click", handleClick, true);
 document.addEventListener("submit", handleSubmit);
+document.addEventListener("change", handleChange);
 document.addEventListener("keydown", handleKeydown);
 
 render();
+void restoreAudioFiles();
 
 function loadState() {
   try {
@@ -56,9 +81,11 @@ function loadState() {
 function saveState() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    return true;
   } catch (error) {
     console.error("Impossible d’enregistrer les données de démonstration.", error);
     showToast("Enregistrement impossible dans ce navigateur.", "error");
+    return false;
   }
 }
 
@@ -80,12 +107,54 @@ function render() {
   const views = {
     accueil: renderHome,
     parcours: renderFlow,
+    extensions: renderEndpoints,
+    audio: renderAudioLibrary,
     architecture: renderArchitecture,
     rappels: renderCallbacks,
     rapports: renderReports,
     reglages: renderSettings,
   };
+  revokeAudioObjectUrls();
   pageContent.innerHTML = views[activePage]();
+}
+
+function renderEndpoints() {
+  const endpoints = state.endpoints;
+  return `
+    <section class="page-heading"><div><p class="eyebrow">COMPTES ET POSTES</p><h1>Extensions &amp; postes</h1><p class="muted">Préparez les profils des softphones et documentez les postes analogiques raccordés derrière une passerelle.</p></div><button class="button button-secondary" data-action="export-config">↓ Exporter les paramètres</button></section>
+    <div class="notice notice-warn"><span class="notice-icon">!</span><div><strong>Configuration descriptive, sans provisionnement</strong><p>Aucun compte n’est créé sur un PBX et aucun appareil n’est contacté. Un softphone devra être configuré manuellement avec des identifiants créés sur une infrastructure PBX sécurisée. Un téléphone analogique nécessite un port FXS réel derrière sa passerelle.</p></div></div>
+    <div class="endpoint-layout">
+      <section class="panel endpoint-editor"><div class="panel-heading"><div><h2>${editingEndpointId ? "Modifier un poste" : "Ajouter un poste ou une extension"}</h2><p>Numéro d’extension interne de 3 à 6 chiffres</p></div>${editingEndpointId ? `<button class="text-button" data-action="cancel-endpoint-edit">Annuler</button>` : ""}</div>
+        <form id="endpoint-form" class="form-stack">
+          <div class="endpoint-form-row"><label>Numéro d’extension<input name="extension" inputmode="numeric" pattern="[0-9]{3,6}" minlength="3" maxlength="6" placeholder="2001" required value="${editingEndpointId ? escapeAttr(endpoints.find((item) => item.id === editingEndpointId)?.extension ?? "") : ""}"></label><label>Nom du poste ou de l’agent<input name="label" maxlength="60" placeholder="Accueil principal" required value="${editingEndpointId ? escapeAttr(endpoints.find((item) => item.id === editingEndpointId)?.label ?? "") : ""}"></label></div>
+          <label>Type de terminal<select name="type" ${editingEndpointId ? "disabled" : ""}><option value="softphone" ${editingEndpointId && endpoints.find((item) => item.id === editingEndpointId)?.type === "softphone" ? "selected" : ""}>Softphone SIP</option><option value="analog" ${editingEndpointId && endpoints.find((item) => item.id === editingEndpointId)?.type === "analog" ? "selected" : ""}>Téléphone analogique via passerelle</option></select></label>
+          <div class="analog-fields ${editingEndpointId && endpoints.find((item) => item.id === editingEndpointId)?.type === "analog" ? "" : "hidden"}"><label>Nom / emplacement de la passerelle FXS<input name="gateway" maxlength="60" placeholder="Passerelle accueil · baie réseau" value="${escapeAttr(editingEndpointId ? endpoints.find((item) => item.id === editingEndpointId)?.gateway ?? "" : "")}"></label><label>Port FXS de la passerelle<input name="port" maxlength="30" placeholder="FXS 1" value="${escapeAttr(editingEndpointId ? endpoints.find((item) => item.id === editingEndpointId)?.port ?? "" : "")}"></label><p class="field-hint">Ces champs décrivent un raccordement sur site. L’interface analogique n’est pas pilotée à distance.</p></div>
+          <div class="endpoint-form-actions"><span class="field-hint">Pas de mot de passe ni de secret SIP dans le navigateur.</span><button class="button button-primary" type="submit">${editingEndpointId ? "Enregistrer les modifications" : "Ajouter l’extension"}</button></div>
+        </form>
+      </section>
+      <section class="panel pbx-settings"><div class="panel-heading"><div><h2>Profil PBX de référence</h2><p>Valeurs à reprendre lors d’un paramétrage manuel et sécurisé.</p></div><span class="subtle-badge">Non connecté</span></div>
+        <form id="pbx-form" class="form-stack"><label>Serveur ou domaine PBX<input name="pbxHost" maxlength="253" placeholder="pbx.exemple.mali" value="${escapeAttr(state.config.pbxHost)}"><span class="field-hint">Nom d’hôte uniquement, sans protocole ni secret. Laisser vide si le PBX n’est pas encore attribué.</span></label><div class="endpoint-form-row"><label>Port SIP<input name="sipPort" type="number" min="1" max="65535" required value="${state.config.sipPort}"></label><label>Transport<select name="sipTransport"><option value="udp" ${state.config.sipTransport === "udp" ? "selected" : ""}>UDP</option><option value="tcp" ${state.config.sipTransport === "tcp" ? "selected" : ""}>TCP</option><option value="tls" ${state.config.sipTransport === "tls" ? "selected" : ""}>TLS · si pris en charge</option></select></label></div><div class="endpoint-form-actions"><span></span><button class="button button-secondary" type="submit">Enregistrer le profil</button></div></form>
+      </section>
+    </div>
+    <section class="panel endpoint-list-panel"><div class="panel-heading"><div><h2>Extensions configurées <span class="count-chip">${endpoints.length}</span></h2><p>Les profils restent sur cet appareil; les états en ligne ne sont pas mesurés.</p></div></div>${endpoints.length ? `<div class="table-scroll"><table><thead><tr><th>Extension</th><th>Poste</th><th>Terminal</th><th>Raccordement</th><th>État</th><th>Actions</th></tr></thead><tbody>${endpoints.map((endpoint) => `<tr><td class="phone-cell">${escapeHtml(endpoint.extension)}</td><td>${escapeHtml(endpoint.label)}</td><td><span class="endpoint-type ${endpoint.type}">${endpoint.type === "softphone" ? "Softphone SIP" : "Téléphone analogique"}</span></td><td>${endpoint.type === "softphone" ? escapeHtml(state.config.pbxHost || "Serveur PBX à définir") : `${escapeHtml(endpoint.gateway)} · ${escapeHtml(endpoint.port)} (FXS)`}</td><td><span class="callback-status pending">Non provisionné</span></td><td class="table-actions"><button class="small-action" data-action="export-endpoint" data-id="${escapeAttr(endpoint.id)}">Exporter</button><button class="small-action" data-action="edit-endpoint" data-id="${escapeAttr(endpoint.id)}">Modifier</button><button class="delete-action" data-action="delete-endpoint" data-id="${escapeAttr(endpoint.id)}" aria-label="Supprimer l’extension ${escapeAttr(endpoint.extension)}">×</button></td></tr>`).join("")}</tbody></table></div>` : emptyState("Aucune extension", "Ajoutez un profil de softphone ou décrivez un poste analogique raccordé à une passerelle FXS.")}</section>`;
+}
+
+function renderAudioLibrary() {
+  const prompts = [
+    ["greeting", "Accueil principal", "Message d’accueil et instructions du menu"],
+    ["1", "Option 1 · Informations", "Annonce associée au premier choix"],
+    ["2", "Option 2 · Services", "Annonce associée au deuxième choix"],
+    ["3", "Option 3 · Demande de rappel", "Consigne générale de rappel, sans détail sensible"],
+    ["closed", "Fermeture / hors horaires", "Annonce à valider par le responsable métier"],
+  ];
+  const assignmentId = (key) => state.config.audioPrompts[key] ?? "";
+  return `
+    <section class="page-heading"><div><p class="eyebrow">BIBLIOTHÈQUE DE MESSAGES</p><h1>Messages audio</h1><p class="muted">Téléversez, écoutez et associez vos propres annonces aux étapes du menu vocal.</p></div><button class="button button-secondary" data-action="export-config">↓ Exporter les paramètres</button></section>
+    <div class="notice notice-demo"><span class="notice-icon">i</span><div><strong>Fichiers audio locaux et explicites</strong><p>Les messages sont enregistrés dans le stockage local de ce navigateur, jamais dans le dépôt GitHub. Importez uniquement des annonces approuvées et non sensibles. Les enregistrements des appelants restent désactivés et cette application ne capture pas d’appels.</p></div></div>
+    <div class="audio-layout"><section class="panel audio-upload-panel"><div class="panel-heading"><div><h2>Ajouter un message</h2><p>WAV, MP3, OGG, AAC, M4A ou WebM · 10 Mo max.</p></div><span class="settings-icon">♫</span></div><form id="audio-upload-form" class="audio-upload-form"><label class="upload-dropzone"><span class="upload-icon">↑</span><strong>Choisir un fichier audio</strong><small>La lecture est disponible avant l’export des paramètres.</small><input type="file" name="audioFile" accept="audio/*,.wav,.mp3,.ogg,.oga,.aac,.m4a,.webm,.weba" required></label><button class="button button-primary" type="submit">Téléverser le message</button><p class="field-hint">Limite : 100 fichiers. Les formats et la durée doivent être vérifiés avant tout déploiement sur un PBX.</p></form></section>
+      <section class="panel audio-assign-panel"><div class="panel-heading"><div><h2>Associer aux annonces</h2><p>Choisissez un fichier ou laissez l’annonce sans audio.</p></div></div><form id="audio-assign-form" class="audio-assignment-list">${prompts.map(([key, label, description]) => `<div class="audio-assignment"><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small>${assignedAudioPlayer(key, `Écouter · ${label}`)}</span><label class="sr-only" for="audio-prompt-${key}">Fichier pour ${escapeHtml(label)}</label><select id="audio-prompt-${key}" name="${key}"><option value="">Aucun fichier audio</option>${state.audioAssets.map((asset) => `<option value="${escapeAttr(asset.id)}" ${assignmentId(key) === asset.id ? "selected" : ""}>${escapeHtml(asset.fileName)}</option>`).join("")}</select></div>`).join("")}<div class="endpoint-form-actions"><span></span><button class="button button-primary" type="submit">Enregistrer les associations</button></div></form></section></div>
+    <section class="panel audio-library-panel"><div class="panel-heading"><div><h2>Fichiers audio <span class="count-chip">${state.audioAssets.length}</span></h2><p>Stockés uniquement dans ce navigateur · absents de l’export JSON.</p></div></div>${state.audioAssets.length ? `<div class="audio-assets-list">${state.audioAssets.map((asset) => `<article class="audio-asset-row"><span class="audio-asset-icon">♫</span><div class="audio-asset-info"><strong>${escapeHtml(asset.fileName)}</strong><small>${escapeHtml(asset.mimeType)} · ${formatBytes(asset.size)} · ajouté le ${formatDate(asset.uploadedAt)}</small></div>${audioBlobs.has(asset.id) ? `<audio controls preload="none" src="${createAudioObjectUrl(asset.id)}" aria-label="Écouter ${escapeAttr(asset.fileName)}"></audio><a class="audio-download" href="${createAudioObjectUrl(asset.id)}" download="${escapeAttr(asset.fileName)}">Télécharger</a>` : `<span class="audio-missing">Fichier local absent</span>`}<button class="delete-action" data-action="delete-audio" data-id="${escapeAttr(asset.id)}" aria-label="Supprimer le fichier audio ${escapeAttr(asset.fileName)}">×</button></article>`).join("")}</div>` : emptyState("Aucun fichier audio", "Téléversez une annonce approuvée pour l’écouter et l’associer au menu.")}</section>
+    <div class="notice notice-warn"><span class="notice-icon">!</span><div><strong>Le SaaS ne diffuse pas ces fichiers dans des appels</strong><p>L’export contient les noms et associations de fichiers, pas leur contenu audio. Le transfert vers le PBX, le codage, la langue, le niveau sonore et la recette téléphonique doivent être traités et testés séparément sur l’infrastructure réelle.</p></div></div>`;
 }
 
 function renderArchitecture() {
@@ -180,7 +249,7 @@ function renderHome() {
     </div>
     <div class="bottom-grid">
       <section class="panel"><div class="panel-heading"><div><h2>Demandes de rappel récentes</h2><p>Numéro utilisé uniquement pour le rappel demandé</p></div><button class="text-button" data-page-link="rappels">Tout voir →</button></div>${renderRecentCallbacks()}</section>
-      <section class="panel privacy-panel"><div class="privacy-lock">⌑</div><div><h2>Confidentialité intégrée</h2><p>Pas d’enregistrement audio. Les rapports sont agrégés et n’incluent jamais le numéro d’appelant.</p><span class="privacy-tag">ENREGISTREMENT DÉSACTIVÉ</span></div></section>
+      <section class="panel privacy-panel"><div class="privacy-lock">⌑</div><div><h2>Confidentialité intégrée</h2><p>Aucun appelant n’est enregistré. Les annonces approuvées sont importées séparément; les rapports sont agrégés et n’incluent aucun numéro.</p><span class="privacy-tag">ENREGISTREMENT DES APPELS DÉSACTIVÉ</span></div></section>
     </div>`;
 }
 
@@ -197,7 +266,7 @@ function renderFlow() {
           <div class="form-actions"><span class="field-hint">Aucun contenu sensible ou médical dans le menu.</span><button class="button button-primary" type="submit">Enregistrer le parcours</button></div>
         </form>
       </section>
-      <aside class="panel flow-side"><div class="panel-heading"><div><h2>Règles du parcours</h2><p>Garde-fous du MVP</p></div></div><ul class="check-list"><li><span>✓</span>Un seul niveau de menu</li><li><span>✓</span>Option agent disponible par 0</li><li><span>✓</span>Pas d’enregistrement audio</li><li><span>✓</span>Motif de rappel non sensible</li><li><span>✓</span>Pas de triage médical</li></ul><div class="mini-hours"><span class="mini-icon">◷</span><div><strong>Horaires annoncés</strong><small>${escapeHtml(state.config.openingTime)} – ${escapeHtml(state.config.closingTime)} · lundi au vendredi</small><button class="text-button" data-page-link="reglages">Modifier les horaires →</button></div></div><div class="flow-tip"><strong>Conseil</strong><p>Faites valider les messages et les destinations par le responsable métier avant toute mise en service réelle.</p></div></aside>
+      <aside class="panel flow-side"><div class="panel-heading"><div><h2>Règles du parcours</h2><p>Garde-fous du MVP</p></div></div><ul class="check-list"><li><span>✓</span>Un seul niveau de menu</li><li><span>✓</span>Option agent disponible par 0</li><li><span>✓</span>Enregistrement des appelants désactivé</li><li><span>✓</span>Motif de rappel non sensible</li><li><span>✓</span>Pas de triage médical</li></ul><div class="mini-hours"><span class="mini-icon">◷</span><div><strong>Horaires annoncés</strong><small>${escapeHtml(state.config.openingTime)} – ${escapeHtml(state.config.closingTime)} · lundi au vendredi</small><button class="text-button" data-page-link="reglages">Modifier les horaires →</button></div></div><div class="flow-tip"><strong>Conseil</strong><p>Faites valider les messages et les destinations par le responsable métier avant toute mise en service réelle. <button type="button" class="text-button" data-page-link="audio">Gérer les messages audio →</button></p></div></aside>
     </div>`;
 }
 
@@ -233,7 +302,7 @@ function renderSettings() {
   return `
     <section class="page-heading"><div><p class="eyebrow">PRÉFÉRENCES ET PROTECTION</p><h1>Réglages</h1><p class="muted">Configuration de la démonstration et limites de traitement des données.</p></div></section>
     <div class="settings-grid"><section class="panel settings-panel"><div class="panel-heading"><div><h2>Horaires d’ouverture</h2><p>Lundi au vendredi, pour l’annonce d’accueil</p></div><span class="settings-icon">◷</span></div><form id="hours-form" class="hours-form"><label>Ouverture<input type="time" name="openingTime" required value="${escapeAttr(state.config.openingTime)}"></label><span class="hours-dash">—</span><label>Fermeture<input type="time" name="closingTime" required value="${escapeAttr(state.config.closingTime)}"></label><button class="button button-primary" type="submit">Enregistrer</button></form></section>
-      <section class="panel settings-panel"><div class="panel-heading"><div><h2>Enregistrement des appels</h2><p>Le MVP ne propose pas de capture audio.</p></div><span class="record-off">DÉSACTIVÉ</span></div><div class="setting-row"><span class="setting-symbol lock-symbol">⌑</span><div><strong>Enregistrement vocal</strong><small>Désactivé et non disponible dans ce prototype. Aucun audio n’est créé ni stocké.</small></div><span class="toggle-off" aria-label="Désactivé"><span></span></span></div></section>
+      <section class="panel settings-panel"><div class="panel-heading"><div><h2>Enregistrement des appels</h2><p>Le MVP ne propose pas de capture audio des appelants.</p></div><span class="record-off">DÉSACTIVÉ</span></div><div class="setting-row"><span class="setting-symbol lock-symbol">⌑</span><div><strong>Enregistrement des conversations</strong><small>Désactivé et non disponible dans ce prototype. Les annonces audio importées sont des fichiers statiques, distincts des appels.</small></div><span class="toggle-off" aria-label="Enregistrement des appels désactivé"><span></span></span></div></section>
       <section class="panel settings-panel"><div class="panel-heading"><div><h2>Données de démonstration</h2><p>Stockées localement dans ce navigateur</p></div><span class="settings-icon">⌂</span></div><div class="retention-list"><div><span>Événements et rapports agrégés</span><strong>30 jours</strong></div><div><span>Rappels en attente</span><strong>30 jours</strong></div><div><span>Rappels clôturés</span><strong>7 jours</strong></div><div><span>Enregistrement audio</span><strong>Aucun</strong></div></div><button class="button button-danger-outline" data-action="clear-data">Effacer les données de démonstration</button></section>
       <section class="panel settings-panel"><div class="panel-heading"><div><h2>Connexion téléphonique</h2><p>Pré-requis à une exploitation réelle</p></div><span class="status-label status-off"><span class="status-dot"></span>Non connecté</span></div><ul class="integration-list"><li><span>Numéro ou renvoi opérateur</span><b>Non provisionné</b></li><li><span>Trunk SIP / PBX</span><b>Non configuré</b></li><li><span>Comptes agents</span><b>Non configurés</b></li><li><span>Authentification administrateur</span><b>Non incluse</b></li></ul><p class="integration-footnote">Ne saisissez aucun secret ni donnée client dans cette démonstration. La mise en service nécessite un audit, un opérateur agréé et une infrastructure sécurisée.</p></section></div>
     <div class="notice notice-warn"><span class="notice-icon">!</span><div><strong>Ne pas utiliser pour des données réelles</strong><p>Cette interface statique ne possède pas de compte utilisateur, serveur ou chiffrement côté serveur. Les données du navigateur ne sont pas protégées contre un autre utilisateur du même appareil.</p></div></div>`;
@@ -266,6 +335,40 @@ function handleClick(event) {
   if (!button) return;
   const { action, id } = button.dataset;
   if (action === "start-simulation") startSimulator();
+  if (action === "cancel-endpoint-edit") {
+    editingEndpointId = null;
+    render();
+  }
+  if (action === "edit-endpoint") {
+    editingEndpointId = id;
+    render();
+    document.querySelector("#endpoint-form [name=extension]")?.focus();
+  }
+  if (action === "delete-endpoint") {
+    if (window.confirm("Supprimer cette fiche de terminal de la configuration locale ?")) {
+      removeEndpoint(state, id);
+      saveState();
+      render();
+      showToast("Fiche de terminal supprimée.");
+    }
+  }
+  if (action === "export-config") downloadJson(
+    buildConfigurationExport(state),
+    "svi-mali-parametres.json",
+  );
+  if (action === "export-endpoint") {
+    try {
+      const endpoint = state.endpoints.find((item) => item.id === id);
+      downloadJson(
+        buildEndpointExport(state, id),
+        `svi-extension-${endpoint.extension}.json`,
+      );
+      showToast("Profil de préparation exporté, sans secret SIP.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+  if (action === "delete-audio") void deleteAudioAssetFromLibrary(id);
   if (action === "select-architecture") {
     selectedArchitecture = id;
     render();
@@ -315,6 +418,62 @@ function handleSubmit(event) {
     render();
     showToast("Horaires enregistrés.");
   }
+  if (event.target.id === "endpoint-form") {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const current = editingEndpointId
+      ? state.endpoints.find((item) => item.id === editingEndpointId)
+      : null;
+    try {
+      const values = {
+        extension: form.get("extension"),
+        label: form.get("label"),
+        type: current?.type ?? form.get("type"),
+        gateway: form.get("gateway"),
+        port: form.get("port"),
+      };
+      if (current) updateEndpoint(state, current.id, values);
+      else addEndpoint(state, values);
+      editingEndpointId = null;
+      saveState();
+      render();
+      showToast(current ? "Fiche de terminal mise à jour." : "Extension ajoutée.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+  if (event.target.id === "pbx-form") {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const host = form.get("pbxHost").trim();
+    if (host && !validatePbxHost(host)) {
+      return showToast("Saisissez un nom d’hôte PBX valide, sans protocole ni secret.", "error");
+    }
+    state.config.pbxHost = host;
+    state.config.sipPort = Number(form.get("sipPort"));
+    state.config.sipTransport = form.get("sipTransport");
+    saveState();
+    render();
+    showToast("Profil PBX enregistré localement; aucune connexion n’a été effectuée.");
+  }
+  if (event.target.id === "audio-upload-form") {
+    event.preventDefault();
+    void uploadAudioFile(event.target);
+  }
+  if (event.target.id === "audio-assign-form") {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    try {
+      for (const promptKey of AUDIO_PROMPT_KEYS) {
+        assignAudioPrompt(state, promptKey, form.get(promptKey) || null);
+      }
+      saveState();
+      render();
+      showToast("Associations audio enregistrées.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
   if (event.target.id === "callback-form") {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -335,6 +494,15 @@ function handleSubmit(event) {
   }
 }
 
+function handleChange(event) {
+  if (event.target.matches("#endpoint-form [name=type]")) {
+    document.querySelector(".analog-fields")?.classList.toggle(
+      "hidden",
+      event.target.value !== "analog",
+    );
+  }
+}
+
 function handleKeydown(event) {
   if (event.key === "Escape" && simulator) closeSimulator(true);
   if (!simulator || simulator.screen !== "menu") return;
@@ -349,7 +517,7 @@ function startSimulator() {
 function showSimulatorMenu() {
   if (!simulator) return;
   simulator.screen = "menu";
-  overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>SIMULATION LOCALE</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="sim-body"><p class="eyebrow">APPEL ENTRANT · TEST</p><h2 id="sim-title">${escapeHtml(state.config.organization)}</h2><p class="sim-greeting">« ${escapeHtml(state.config.greeting)} »</p><p class="sim-prompt">Choisissez une option pour continuer :</p><div class="sim-options">${state.config.services.map((service) => `<button class="sim-option" data-action="sim-key" data-key="${service.key}"><span class="keycap">${service.key}</span><span>${escapeHtml(service.label)}</span><span class="option-chevron">›</span></button>`).join("")}<button class="sim-option agent-option" data-action="sim-key" data-key="0"><span class="keycap agent-key">0</span><span>Parler à un agent</span><span class="option-chevron">›</span></button></div><p class="sim-hint">Clavier : touches numériques · Aucun appel réel n’est effectué.</p></div><div class="sim-footer"><span>◖ &nbsp;Durée simulée : 00:00</span><button class="text-button hangup-button" data-action="sim-close">Terminer le test</button></div></section></div>`;
+  overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>SIMULATION LOCALE</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="sim-body"><p class="eyebrow">APPEL ENTRANT · TEST</p><h2 id="sim-title">${escapeHtml(state.config.organization)}</h2><p class="sim-greeting">« ${escapeHtml(state.config.greeting)} »</p>${assignedAudioPlayer("greeting", "Écouter l’annonce d’accueil") }<p class="sim-prompt">Choisissez une option pour continuer :</p><div class="sim-options">${state.config.services.map((service) => `<button class="sim-option" data-action="sim-key" data-key="${service.key}"><span class="keycap">${service.key}</span><span>${escapeHtml(service.label)}</span><span class="option-chevron">›</span></button>`).join("")}<button class="sim-option agent-option" data-action="sim-key" data-key="0"><span class="keycap agent-key">0</span><span>Parler à un agent</span><span class="option-chevron">›</span></button></div><p class="sim-hint">Clavier : touches numériques · Aucun appel réel n’est effectué.</p></div><div class="sim-footer"><span>◖ &nbsp;Durée simulée : 00:00</span><button class="text-button hangup-button" data-action="sim-close">Terminer le test</button></div></section></div>`;
   overlayRoot.querySelector(".sim-option").focus();
 }
 
@@ -358,22 +526,22 @@ function chooseMenu(key) {
   if (key === "1") {
     simulator.pendingOutcome = { option: "1", outcome: "information" };
     simulator.screen = "info";
-    overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>OPTION 1 · INFORMATION</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content"><span class="result-icon info-result">i</span><h2 id="sim-title">Information</h2><p>Le service d’accueil est ouvert du lundi au vendredi, de ${escapeHtml(state.config.openingTime)} à ${escapeHtml(state.config.closingTime)}.</p><div class="sim-callout">Message de démonstration · Les horaires doivent être confirmés par l’organisation.</div><button class="button button-primary" data-action="sim-back">Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Résultat enregistré sans donnée d’appelant</span><button class="text-button hangup-button" data-action="sim-close">Terminer</button></div></section></div>`;
+    overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>OPTION 1 · INFORMATION</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content"><span class="result-icon info-result">i</span><h2 id="sim-title">Information</h2><p>Le service d’accueil est ouvert du lundi au vendredi, de ${escapeHtml(state.config.openingTime)} à ${escapeHtml(state.config.closingTime)}.</p>${assignedAudioPlayer("1", "Écouter l’annonce de l’option 1")}<div class="sim-callout">Message de démonstration · Les horaires doivent être confirmés par l’organisation.</div><button class="button button-primary" data-action="sim-back">Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Résultat enregistré sans donnée d’appelant</span><button class="text-button hangup-button" data-action="sim-close">Terminer</button></div></section></div>`;
   } else if (key === "2" || key === "0") {
     const service = key === "0" ? null : state.config.services.find((item) => item.key === key);
     simulator.pendingOutcome = { option: key, outcome: "transfert_simule" };
     simulator.screen = "transfer";
-    overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>TRANSFERT SIMULÉ</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content"><span class="result-icon transfer-result">⇢</span><h2 id="sim-title">${key === "0" ? "Option agent" : escapeHtml(service.label)}</h2><p>Dans un déploiement réel, cet appel serait dirigé vers <strong>${key === "0" ? "un agent" : escapeHtml(service.destination)}</strong>.</p><div class="sim-callout">Aucun poste ou numéro téléphonique n’est configuré. Le transfert n’a pas lieu.</div><button class="button button-primary" data-action="sim-back">Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Résultat enregistré sans donnée d’appelant</span><button class="text-button hangup-button" data-action="sim-close">Terminer</button></div></section></div>`;
+    overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>TRANSFERT SIMULÉ</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content"><span class="result-icon transfer-result">⇢</span><h2 id="sim-title">${key === "0" ? "Option agent" : escapeHtml(service.label)}</h2><p>Dans un déploiement réel, cet appel serait dirigé vers <strong>${key === "0" ? "un agent" : escapeHtml(service.destination)}</strong>.</p>${key === "2" ? assignedAudioPlayer("2", "Écouter l’annonce de l’option 2") : ""}<div class="sim-callout">Aucun poste ou numéro téléphonique n’est configuré. Le transfert n’a pas lieu.</div><button class="button button-primary" data-action="sim-back">Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Résultat enregistré sans donnée d’appelant</span><button class="text-button hangup-button" data-action="sim-close">Terminer</button></div></section></div>`;
   } else if (key === "3") {
     simulator.screen = "callback";
-    overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>OPTION 3 · DEMANDE DE RAPPEL</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content callback-form-content"><span class="result-icon callback-result">↗</span><h2 id="sim-title">Être rappelé</h2><p>Seules les informations nécessaires au rappel sont demandées. N’indiquez aucun détail sensible.</p><form id="callback-form" class="form-stack"><label>Numéro de téléphone<input id="callback-phone" name="phone" type="tel" autocomplete="tel" inputmode="tel" placeholder="70 12 34 56" required aria-describedby="callback-phone-error"><span id="callback-phone-error" class="field-error" aria-live="polite"></span></label><label>Motif général<select name="reason" required><option value="information">Demande d’information</option><option value="rendez-vous">Rendez-vous</option><option value="autre">Autre demande</option></select></label><p class="consent-note">En demandant ce rappel, vous acceptez que ce numéro soit utilisé uniquement pour vous recontacter au sujet de cette demande.</p><button class="button button-primary" type="submit">Confirmer ma demande</button></form><button class="text-button back-menu" data-action="sim-back">← Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Le numéro ne sera pas ajouté aux rapports</span><button class="text-button hangup-button" data-action="sim-close">Annuler</button></div></section></div>`;
+    overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>OPTION 3 · DEMANDE DE RAPPEL</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content callback-form-content"><span class="result-icon callback-result">↗</span><h2 id="sim-title">Être rappelé</h2><p>Seules les informations nécessaires au rappel sont demandées. N’indiquez aucun détail sensible.</p>${assignedAudioPlayer("3", "Écouter l’annonce de l’option 3")}<form id="callback-form" class="form-stack"><label>Numéro de téléphone<input id="callback-phone" name="phone" type="tel" autocomplete="tel" inputmode="tel" placeholder="70 12 34 56" required aria-describedby="callback-phone-error"><span id="callback-phone-error" class="field-error" aria-live="polite"></span></label><label>Motif général<select name="reason" required><option value="information">Demande d’information</option><option value="rendez-vous">Rendez-vous</option><option value="autre">Autre demande</option></select></label><p class="consent-note">En demandant ce rappel, vous acceptez que ce numéro soit utilisé uniquement pour vous recontacter au sujet de cette demande.</p><button class="button button-primary" type="submit">Confirmer ma demande</button></form><button class="text-button back-menu" data-action="sim-back">← Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Le numéro ne sera pas ajouté aux rapports</span><button class="text-button hangup-button" data-action="sim-close">Annuler</button></div></section></div>`;
     document.querySelector("#callback-phone").focus();
   } else {
     simulator.invalid += 1;
     if (simulator.invalid >= 2) {
       simulator.pendingOutcome = { option: "invalide", outcome: "transfert_simule" };
       simulator.screen = "invalid";
-      overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>AUCUNE OPTION SÉLECTIONNÉE</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content"><span class="result-icon transfer-result">⇢</span><h2 id="sim-title">Besoin d’aide ?</h2><p>Après deux erreurs, l’appel serait proposé à un agent dans un déploiement réel.</p><div class="sim-callout">Transfert humain simulé · aucun appel réel n’est effectué.</div><button class="button button-primary" data-action="sim-back">Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Aucun enregistrement audio</span><button class="text-button hangup-button" data-action="sim-close">Terminer</button></div></section></div>`;
+      overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="sim-close"><section class="sim-modal result-modal" role="dialog" aria-modal="true" aria-labelledby="sim-title" onclick="event.stopPropagation()"><div class="sim-header"><div><span class="sim-live-dot"></span><span>AUCUNE OPTION SÉLECTIONNÉE</span></div><button class="modal-close" data-action="sim-close" aria-label="Fermer">×</button></div><div class="result-content"><span class="result-icon transfer-result">⇢</span><h2 id="sim-title">Besoin d’aide ?</h2><p>Après deux erreurs, l’appel serait proposé à un agent dans un déploiement réel.</p><div class="sim-callout">Transfert humain simulé · aucun appel réel n’est effectué.</div><button class="button button-primary" data-action="sim-back">Retour au menu</button></div><div class="sim-footer"><span>◖ &nbsp;Aucun appelant n’est enregistré</span><button class="text-button hangup-button" data-action="sim-close">Terminer</button></div></section></div>`;
     } else {
       overlayRoot.querySelector(".sim-prompt").textContent = "Option non reconnue. Vous pouvez réessayer ou choisir 0 pour un agent.";
       overlayRoot.querySelector(".sim-prompt").classList.add("error-text");
@@ -407,13 +575,20 @@ function recordSimulatorOutcome(outcome) {
 }
 
 function confirmClearData() {
-  overlayRoot.innerHTML = `<div class="modal-backdrop"><section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><button class="modal-close" data-action="cancel-clear" aria-label="Fermer">×</button><span class="result-icon danger-result">!</span><h2 id="confirm-title">Effacer toutes les données ?</h2><p>Les simulations, rapports et demandes de rappel stockés dans ce navigateur seront supprimés définitivement.</p><div class="confirm-actions"><button class="button button-secondary" data-action="cancel-clear">Annuler</button><button class="button button-danger" data-action="confirm-clear">Effacer les données</button></div></section></div>`;
-  overlayRoot.querySelector('[data-action="confirm-clear"]').addEventListener("click", () => {
-    localStorage.removeItem(STORAGE_KEY);
-    state = createInitialState();
-    overlayRoot.innerHTML = "";
-    render();
-    showToast("Données de démonstration effacées.");
+  overlayRoot.innerHTML = `<div class="modal-backdrop"><section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><button class="modal-close" data-action="cancel-clear" aria-label="Fermer">×</button><span class="result-icon danger-result">!</span><h2 id="confirm-title">Effacer toutes les données ?</h2><p>Les simulations, rappels, profils, associations et fichiers audio de ce navigateur seront supprimés définitivement.</p><div class="confirm-actions"><button class="button button-secondary" data-action="cancel-clear">Annuler</button><button class="button button-danger" data-action="confirm-clear">Effacer les données</button></div></section></div>`;
+  overlayRoot.querySelector('[data-action="confirm-clear"]').addEventListener("click", async () => {
+    try {
+      await clearAudioFiles();
+      localStorage.removeItem(STORAGE_KEY);
+      state = createInitialState();
+      audioBlobs.clear();
+      audioFilesReady = true;
+      overlayRoot.innerHTML = "";
+      render();
+      showToast("Données et fichiers audio de démonstration effacés.");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
   }, { once: true });
   overlayRoot.querySelectorAll('[data-action="cancel-clear"]').forEach((button) => {
     button.addEventListener("click", () => { overlayRoot.innerHTML = ""; }, { once: true });
@@ -421,7 +596,7 @@ function confirmClearData() {
 }
 
 function showAbout() {
-  overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="dismiss-about"><section class="confirm-modal about-modal" role="dialog" aria-modal="true" aria-labelledby="about-title"><button class="modal-close" data-action="dismiss-about" aria-label="Fermer">×</button><span class="brand-mark about-mark">s</span><h2 id="about-title">SVI Mali · démonstration</h2><p>Prototype d’accueil vocal interactif pour administrations maliennes : menu DTMF, orientation, demandes de rappel minimales et indicateurs agrégés.</p><ul><li>Pas de trunk ou d’opérateur téléphonique connecté.</li><li>Pas de diagnostic médical, paiement ou collecte sensible.</li><li>Enregistrement audio désactivé et non disponible.</li><li>Les données restent dans ce navigateur.</li></ul><button class="button button-primary" data-action="dismiss-about">Compris</button></section></div>`;
+  overlayRoot.innerHTML = `<div class="modal-backdrop" data-action="dismiss-about"><section class="confirm-modal about-modal" role="dialog" aria-modal="true" aria-labelledby="about-title"><button class="modal-close" data-action="dismiss-about" aria-label="Fermer">×</button><span class="brand-mark about-mark">s</span><h2 id="about-title">SVI Mali · démonstration</h2><p>Prototype d’accueil vocal interactif pour administrations maliennes : menu DTMF, orientation, profils d’extensions, annonces audio locales, demandes de rappel minimales et indicateurs agrégés.</p><ul><li>Pas de trunk ou d’opérateur téléphonique connecté.</li><li>Pas de diagnostic médical, paiement ou collecte sensible.</li><li>Enregistrement des appels désactivé; annonces audio statiques conservées localement.</li><li>Profils téléphoniques descriptifs, sans provisionnement d’appareil ou de PBX.</li></ul><button class="button button-primary" data-action="dismiss-about">Compris</button></section></div>`;
   overlayRoot.querySelectorAll('[data-action="dismiss-about"]').forEach((button) => {
     button.addEventListener("click", () => { overlayRoot.innerHTML = ""; });
   });
@@ -440,6 +615,112 @@ function showToast(message, type = "success") {
   toast.classList.add("toast-visible");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.remove("toast-visible"), 2800);
+}
+
+async function restoreAudioFiles() {
+  try {
+    const records = await Promise.all(state.audioAssets.map((asset) => getAudioFile(asset.id)));
+    records.forEach((record) => {
+      if (record?.blob instanceof Blob) audioBlobs.set(record.id, record.blob);
+    });
+  } catch (error) {
+    console.error("Impossible de restaurer les fichiers audio locaux.", error);
+    showToast(error.message, "error");
+  } finally {
+    audioFilesReady = true;
+    if (activePage === "audio") render();
+  }
+}
+
+async function uploadAudioFile(formElement) {
+  const file = new FormData(formElement).get("audioFile");
+  if (!(file instanceof File) || !file.size) {
+    showToast("Choisissez un fichier audio avant de téléverser.", "error");
+    return;
+  }
+  if (state.audioAssets.length >= 100) {
+    showToast("La bibliothèque est limitée à 100 fichiers audio.", "error");
+    return;
+  }
+  let mimeType;
+  try {
+    mimeType = validateAudioFile(file);
+    const asset = await saveAudioFile(file, mimeType);
+    try {
+      addAudioAsset(state, asset);
+    } catch (error) {
+      await deleteAudioFile(asset.id);
+      throw error;
+    }
+    if (!saveState()) {
+      removeAudioAsset(state, asset.id);
+      await deleteAudioFile(asset.id);
+      return;
+    }
+    audioBlobs.set(asset.id, file);
+    audioFilesReady = true;
+    formElement.reset();
+    render();
+    showToast("Message audio téléversé dans ce navigateur.");
+  } catch (error) {
+    console.error("Impossible de téléverser le fichier audio.", error);
+    showToast(error.message, "error");
+  }
+}
+
+async function deleteAudioAssetFromLibrary(id) {
+  const asset = state.audioAssets.find((item) => item.id === id);
+  if (!asset || !window.confirm(`Supprimer « ${asset.fileName} » et ses associations ?`)) return;
+  try {
+    await deleteAudioFile(id);
+    removeAudioAsset(state, id);
+    audioBlobs.delete(id);
+    saveState();
+    render();
+    showToast("Fichier audio supprimé et associations retirées.");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function createAudioObjectUrl(id) {
+  const blob = audioBlobs.get(id);
+  if (!blob) return "";
+  const url = URL.createObjectURL(blob);
+  audioObjectUrls.push(url);
+  return url;
+}
+
+function revokeAudioObjectUrls() {
+  audioObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+  audioObjectUrls = [];
+}
+
+function assignedAudioPlayer(promptKey, label) {
+  const assetId = state.config.audioPrompts[promptKey];
+  if (!assetId) return "";
+  const asset = state.audioAssets.find((item) => item.id === assetId);
+  if (!asset) return "";
+  const source = audioBlobs.has(assetId)
+    ? `<audio controls preload="none" src="${createAudioObjectUrl(assetId)}" aria-label="${escapeAttr(label)}"></audio>`
+    : `<span class="audio-missing">${audioFilesReady ? "Fichier absent de ce navigateur" : "Chargement du fichier audio…"}</span>`;
+  return `<div class="sim-audio-prompt"><span>${escapeHtml(label)} · ${escapeHtml(asset.fileName)}</span>${source}</div>`;
+}
+
+function downloadJson(value, fileName) {
+  const blob = new Blob([`${JSON.stringify(value, null, 2)}\n`], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function formatBytes(size) {
+  if (size < 1024) return `${size} o`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} Ko`;
+  return `${(size / (1024 * 1024)).toFixed(1)} Mo`;
 }
 
 function maskPhone(phone) {
