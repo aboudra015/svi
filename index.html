@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#102b24" />
+    <meta
+      name="description"
+      content="Console de démonstration du serveur vocal interactif pour les administrations maliennes."
+    />
+    <title>Accueil — SVI Mali</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./src/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Navigation principale">
+        <a class="brand" href="#accueil" data-page="accueil" aria-label="SVI Mali, accueil">
+          <span class="brand-mark" aria-hidden="true">s</span>
+          <span class="brand-copy"><strong>svi</strong><small>administrations maliennes</small></span>
+        </a>
+        <div class="workspace-label">ESPACE DE TRAVAIL</div>
+        <nav class="nav-list">
+          <button class="nav-link active" data-page="accueil"><span class="nav-icon">◫</span>Vue d’ensemble</button>
+          <button class="nav-link" data-page="parcours"><span class="nav-icon">⌘</span>Parcours vocal</button>
+          <button class="nav-link" data-page="architecture"><span class="nav-icon">⌁</span>Architecture téléphonique</button>
+          <button class="nav-link" data-page="rappels"><span class="nav-icon">↗</span>Demandes de rappel <span class="nav-count" id="callback-count">0</span></button>
+          <button class="nav-link" data-page="rapports"><span class="nav-icon">▥</span>Rapports</button>
+          <button class="nav-link" data-page="reglages"><span class="nav-icon">⚙</span>Réglages</button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="operator-card">
+            <span class="status-dot"></span>
+            <div><strong>Mode démonstration</strong><small>Aucun opérateur connecté</small></div>
+          </div>
+          <div class="profile">
+            <span class="avatar">SM</span>
+            <span><strong>Équipe SVI Mali</strong><small>Administrateur local</small></span>
+            <span class="profile-more">···</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>Administration</span><span class="crumb-separator">/</span><strong id="breadcrumb-current">Vue d’ensemble</strong></div>
+          <div class="topbar-actions">
+            <span class="demo-pill"><span class="status-dot"></span>Environnement de démonstration</span>
+            <button class="icon-button" id="help-button" aria-label="À propos de la démonstration" title="À propos">?</button>
+          </div>
+        </header>
+        <section id="page-content" class="page-content" aria-live="polite"></section>
+        <footer class="footer-note">
+          <span>SVI Mali <span id="current-year"></span></span>
+          <span>Prototype de démonstration · Ne traite aucun appel téléphonique réel</span>
+        </footer>
+      </main>
+    </div>
+    <div id="overlay-root"></div>
+  </body>
+</html>
